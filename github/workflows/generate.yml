@@ -1,0 +1,36 @@
+name: Generate Cartola Messages
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "40 21 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Generate
+        env:
+          CARTOLA_LEAGUE_SLUG: show-de-bola-araca-f-c
+          PREMIADOS_TOP: 4
+          CARTOLA_BEARER: ${{ secrets.CARTOLA_BEARER }}
+          CARTOLA_GLB_TAG: ${{ secrets.CARTOLA_GLB_TAG }}
+        run: |
+          npm run generate
+
+      - name: Commit docs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs
+          git commit -m "update messages" || echo "No changes"
+          git push
