@@ -1,0 +1,9 @@
+{
+  "name": "cartola-mensagens",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "generate": "node scripts/generate.js"
+  }
+}
