@@ -4,6 +4,9 @@
   "private": true,
   "type": "commonjs",
   "scripts": {
-    "generate": "node scripts/generate.js"
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
   }
 }
