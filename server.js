@@ -1,7 +1,6 @@
 'use strict';
 
 const express = require('express');
-
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
@@ -11,9 +10,8 @@ app.use(express.json({ limit: '1mb' }));
 const LEAGUE_SLUG = process.env.CARTOLA_LEAGUE_SLUG || 'show-de-bola-araca-f-c';
 const LIGA_ID = Number(process.env.CARTOLA_LIGA_ID || '0') || 0;
 
-const BEARER = (process.env.CARTOLA_BEARER || '').trim(); // SEM "Bearer " (opcional agora)
+const BEARER = (process.env.CARTOLA_BEARER || '').trim(); // SEM "Bearer " (pode ser vazio)
 const GLB_TAG = (process.env.CARTOLA_GLB_TAG || '').trim(); // opcional
-
 const PREMIADOS_TOP = Number(process.env.PREMIADOS_TOP || '4');
 const PORT = Number(process.env.PORT || '3000');
 
@@ -99,7 +97,7 @@ async function fetchSmart(url) {
 // Cache simples em memória
 // =====================
 const CACHE_TTL_MS = 10 * 60 * 1000; // 10 min
-const cache = new Map(); // key -> {ts, value}
+const cache = new Map();
 
 function cacheGet(key) {
   const item = cache.get(key);
@@ -115,8 +113,36 @@ function cacheSet(key, value) {
 }
 
 // =====================
-// Cartola data extraction
+// Cartola data
 // =====================
+async function fetchMercadoStatus() {
+  return await fetchJson('https://api.cartola.globo.com/mercado/status', false);
+}
+
+/**
+ * ✅ Busca da liga com fallback:
+ * 1) /liga (público)
+ * 2) /auth/liga (precisa token)
+ */
+async function fetchLiga(orderBy = 'campeonato') {
+  const publicUrl = `https://api.cartola.globo.com/liga/${LEAGUE_SLUG}?orderBy=${encodeURIComponent(orderBy)}&page=1`;
+
+  try {
+    return await fetchJson(publicUrl, false);
+  } catch (e) {
+    // Se a liga não puder ser obtida publicamente, cai pro /auth
+    if (!BEARER) {
+      throw new Error(
+        `A liga não está acessível via endpoint público e CARTOLA_BEARER não está configurado.\n` +
+        `Detalhe do público: ${e.message}`
+      );
+    }
+
+    const authUrl = `https://api.cartola.globo.com/auth/liga/${LEAGUE_SLUG}?orderBy=${encodeURIComponent(orderBy)}&page=1`;
+    return await fetchJson(authUrl, true);
+  }
+}
+
 function extractRoundPoints(timeRoundJson) {
   if (typeof timeRoundJson === 'number') return timeRoundJson;
   if (timeRoundJson == null || typeof timeRoundJson !== 'object') return null;
@@ -132,23 +158,13 @@ function extractRoundPoints(timeRoundJson) {
   return null;
 }
 
-async function fetchMercadoStatus() {
-  return await fetchJson('https://api.cartola.globo.com/mercado/status', false);
-}
-
-// ✅ AQUI está a alteração definitiva: endpoint público /liga (sem /auth)
-async function fetchLigaPublica(orderBy = 'campeonato') {
-  const url = `https://api.cartola.globo.com/liga/${LEAGUE_SLUG}?orderBy=${encodeURIComponent(orderBy)}&page=1`;
-  return await fetchJson(url, false);
-}
-
 async function fetchTimeRound(timeId, rodada) {
   const key = `time:${timeId}:rodada:${rodada}`;
   const cached = cacheGet(key);
   if (cached) return cached;
 
   const url = `https://api.cartola.globo.com/time/id/${timeId}/${rodada}`;
-  const data = await fetchSmart(url); // tenta sem token, se pedir auth usa token
+  const data = await fetchSmart(url); // sem token; se pedir, usa token
 
   cacheSet(key, data);
   return data;
@@ -165,7 +181,6 @@ function lastClosedRound(status) {
   if (rodadaAtual <= 1) return 0;
   if (mercado === 1) return rodadaAtual - 1;
   if (bolaRolando) return rodadaAtual - 1;
-
   return rodadaAtual - 1;
 }
 
@@ -316,7 +331,7 @@ app.get('/rodada', async (req, res) => {
     const status = await fetchMercadoStatus();
     const rodadaAtual = Number(status.rodada_atual || 1);
 
-    const ligaData = await fetchLigaPublica('rodada');
+    const ligaData = await fetchLiga('rodada');
     const ligaNome = ligaData?.liga?.nome || 'Liga';
     const times = ligaData?.times || [];
 
@@ -331,7 +346,7 @@ app.get('/geral', async (req, res) => {
     const status = await fetchMercadoStatus();
     const rodadaAtual = Number(status.rodada_atual || 1);
 
-    const ligaData = await fetchLigaPublica('campeonato');
+    const ligaData = await fetchLiga('campeonato');
     const ligaNome = ligaData?.liga?.nome || 'Liga';
     const times = ligaData?.times || [];
 
@@ -345,7 +360,7 @@ app.get('/mensal', async (req, res) => {
   try {
     const status = await fetchMercadoStatus();
 
-    const ligaData = await fetchLigaPublica('campeonato'); // lista de times + ids
+    const ligaData = await fetchLiga('campeonato');
     const ligaNome = ligaData?.liga?.nome || 'Liga';
     const times = ligaData?.times || [];
 
