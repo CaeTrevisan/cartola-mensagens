@@ -4,25 +4,16 @@ const express = require('express');
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-// =====================
-// ENV (Render)
-// =====================
 const LEAGUE_SLUG = process.env.CARTOLA_LEAGUE_SLUG || 'show-de-bola-araca-f-c';
 const PREMIADOS_TOP = Number(process.env.PREMIADOS_TOP || '4');
 const PORT = Number(process.env.PORT || '3000');
 
 const GLB_TAG = (process.env.CARTOLA_GLB_TAG || '').trim();
 
-// Access token curto (pode iniciar vazio; o refresh cuida)
 let accessToken = (process.env.CARTOLA_BEARER || '').trim(); // sem "Bearer "
-
-// Refresh token (longo) — evita ficar atualizando token manualmente
 const REFRESH_TOKEN = (process.env.CARTOLA_REFRESH_TOKEN || '').trim();
+const CLIENT_ID = (process.env.CARTOLA_CLIENT_ID || '').trim(); // AGORA: obrigatório idealmente
 
-// Client ID do Cartola (padrão correto)
-const CLIENT_ID = (process.env.CARTOLA_CLIENT_ID || 'cartola-web@apps.globoid').trim();
-
-// Blocos “mensal personalizado”
 const MONTH_BLOCKS = [
   { label: 'Rodadas 1 a 4 (jan/fev)', start: 1, end: 4 },
   { label: 'Rodadas 5 a 8 (mar)', start: 5, end: 8 },
@@ -51,9 +42,7 @@ function header(ligaNome) {
   return `🏆 ${ligaNome}\n🕒 ${nowBR()}\n`;
 }
 
-// =====================
-// JWT helpers (checar expiração)
-// =====================
+// ===== JWT exp check =====
 function decodeJwtPayload(token) {
   try {
     const parts = token.split('.');
@@ -74,29 +63,25 @@ function isTokenValid(token) {
   const exp = tokenExpSeconds(token);
   if (!exp) return false;
   const now = Math.floor(Date.now() / 1000);
-  return exp > (now + 60); // margem de 60s
+  return exp > (now + 60);
 }
 
-// =====================
-// Auto refresh do access token
-// =====================
-async function refreshAccessTokenIfNeeded() {
-  if (isTokenValid(accessToken)) return { refreshed: false };
-
-  if (!REFRESH_TOKEN) {
-    return { refreshed: false, error: 'Sem CARTOLA_REFRESH_TOKEN configurado no Render.' };
-  }
-
+// ===== Refresh =====
+async function refreshWithClientId(clientId) {
   const tokenUrl = 'https://goidc.globo.com/auth/realms/globo.com/protocol/openid-connect/token';
 
   const body = new URLSearchParams();
   body.set('grant_type', 'refresh_token');
-  body.set('client_id', CLIENT_ID);
+  body.set('client_id', clientId);
   body.set('refresh_token', REFRESH_TOKEN);
 
   const res = await fetch(tokenUrl, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Accept': 'application/json',
+      'User-Agent': 'Mozilla/5.0'
+    },
     body
   });
 
@@ -105,21 +90,53 @@ async function refreshAccessTokenIfNeeded() {
   try { data = JSON.parse(text); } catch { data = { raw: text }; }
 
   if (!res.ok) {
-    const msg = data?.error_description || data?.error || text;
-    return { refreshed: false, error: `Falha ao renovar token: HTTP ${res.status} — ${msg}` };
+    const msg = data?.error_description || data?.error || data?.raw || text;
+    const err = new Error(`HTTP ${res.status} — ${msg}`);
+    err.status = res.status;
+    err.data = data;
+    throw err;
   }
 
   if (!data?.access_token) {
-    return { refreshed: false, error: 'Resposta do refresh não trouxe access_token.' };
+    throw new Error(`Refresh ok mas sem access_token. Resposta: ${text.slice(0, 300)}`);
   }
 
   accessToken = String(data.access_token).trim();
-  return { refreshed: true, exp: tokenExpSeconds(accessToken) };
+  return { ok: true, client_id: clientId, exp: tokenExpSeconds(accessToken) };
 }
 
-// =====================
-// HTTP helpers (Cartola)
-// =====================
+async function refreshAccessTokenIfNeeded() {
+  if (isTokenValid(accessToken)) return { refreshed: false };
+
+  if (!REFRESH_TOKEN) {
+    return { refreshed: false, error: 'Sem CARTOLA_REFRESH_TOKEN no Render.' };
+  }
+
+  // tenta primeiro o CLIENT_ID do Render; se vazio, pula pro fallback
+  const candidates = [];
+  if (CLIENT_ID) candidates.push(CLIENT_ID);
+  // fallback comum (muitos fluxos usam assim)
+  candidates.push('cartola-web');
+
+  let lastErr = null;
+  for (const cid of candidates) {
+    try {
+      const r = await refreshWithClientId(cid);
+      return { refreshed: true, ...r };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+
+  return {
+    refreshed: false,
+    error:
+      `Falha ao renovar token. Provável client_id errado ou refresh_token inválido.\n` +
+      `Último erro: ${lastErr?.message || 'desconhecido'}`
+  };
+}
+
+// ===== HTTP cartola =====
 function baseHeaders(useAuth) {
   const h = {
     accept: '*/*',
@@ -157,7 +174,6 @@ async function fetchJson(url, useAuth = false) {
   }
 }
 
-// tenta sem auth -> se 401/403, tenta com auth (e auto-refresh)
 async function fetchSmart(url) {
   try {
     return await fetchJson(url, false);
@@ -173,46 +189,36 @@ async function fetchMercadoStatus() {
   return await fetchJson('https://api.cartola.globo.com/mercado/status', false);
 }
 
-// Liga: tenta público; se liga for privada/bloqueada, cai pro /auth com token renovável
 async function fetchLiga(orderBy = 'campeonato') {
+  // pública primeiro
   const publicUrl = `https://api.cartola.globo.com/liga/${LEAGUE_SLUG}?orderBy=${encodeURIComponent(orderBy)}&page=1`;
   try {
     return await fetchJson(publicUrl, false);
   } catch {
+    // auth com refresh
     const authUrl = `https://api.cartola.globo.com/auth/liga/${LEAGUE_SLUG}?orderBy=${encodeURIComponent(orderBy)}&page=1`;
     return await fetchJson(authUrl, true);
   }
 }
 
-// =====================
-// Cache simples
-// =====================
+// ===== Cache e cálculo mensal =====
 const CACHE_TTL_MS = 10 * 60 * 1000;
 const cache = new Map();
-
 function cacheGet(key) {
   const item = cache.get(key);
   if (!item) return null;
-  if (Date.now() - item.ts > CACHE_TTL_MS) {
-    cache.delete(key);
-    return null;
-  }
+  if (Date.now() - item.ts > CACHE_TTL_MS) { cache.delete(key); return null; }
   return item.value;
 }
-function cacheSet(key, value) {
-  cache.set(key, { ts: Date.now(), value });
-}
+function cacheSet(key, value) { cache.set(key, { ts: Date.now(), value }); }
 
 function extractRoundPoints(timeRoundJson) {
   if (typeof timeRoundJson === 'number') return timeRoundJson;
   if (!timeRoundJson || typeof timeRoundJson !== 'object') return null;
-
   if (typeof timeRoundJson.pontos === 'number') return timeRoundJson.pontos;
   if (typeof timeRoundJson.pontos_rodada === 'number') return timeRoundJson.pontos_rodada;
-
   if (timeRoundJson.pontos && typeof timeRoundJson.pontos.rodada === 'number') return timeRoundJson.pontos.rodada;
   if (timeRoundJson.time && typeof timeRoundJson.time.pontos === 'number') return timeRoundJson.time.pontos;
-
   return null;
 }
 
@@ -223,14 +229,10 @@ async function fetchTimeRound(timeId, rodada) {
 
   const url = `https://api.cartola.globo.com/time/id/${timeId}/${rodada}`;
   const data = await fetchSmart(url);
-
   cacheSet(key, data);
   return data;
 }
 
-// =====================
-// Regras / textos
-// =====================
 function lastClosedRound(status) {
   const rodadaAtual = Number(status.rodada_atual || 1);
   const mercado = Number(status.status_mercado ?? 1);
@@ -327,9 +329,7 @@ async function buildMensalPersonalizadoMsg(ligaNome, status, ligaTimes) {
         const data = await fetchTimeRound(timeId, r);
         const pts = extractRoundPoints(data);
         if (typeof pts === 'number' && Number.isFinite(pts)) soma += pts;
-      } catch {
-        // ignora falha pontual
-      }
+      } catch {}
     }
 
     results.push({
@@ -351,48 +351,41 @@ async function buildMensalPersonalizadoMsg(ligaNome, status, ligaTimes) {
     out += `${String(idx + 1).padStart(2, '0')}) ${x.nome} (${x.nome_cartola}) — ${fmt(x.soma)} pts\n`;
   });
 
-  out += `\n🧾 Observação: somatório calculado rodada a rodada (seu calendário mensal personalizado).\n`;
+  out += `\n🧾 Observação: somatório calculado rodada a rodada.\n`;
   return out.trim();
 }
 
-// =====================
-// Routes
-// =====================
+// ===== Routes =====
 app.get('/', (req, res) => res.status(200).send('OK'));
 
-// debug: mostra se o refresh está ativo e exp do token atual
-app.get('/debug', async (req, res) => {
-  try {
-    const status = await fetchMercadoStatus();
-    const exp = accessToken ? tokenExpSeconds(accessToken) : null;
+app.get('/debug', (req, res) => {
+  res.json({
+    ok: true,
+    now: new Date().toISOString(),
+    nowBR: nowBR(),
+    leagueSlug: LEAGUE_SLUG,
+    accessTokenConfigured: Boolean(accessToken),
+    accessTokenExp: accessToken ? tokenExpSeconds(accessToken) : null,
+    refreshTokenConfigured: Boolean(REFRESH_TOKEN),
+    clientIdConfigured: Boolean(CLIENT_ID),
+    clientIdValue: CLIENT_ID || null
+  });
+});
 
-    res.json({
-      ok: true,
-      now: new Date().toISOString(),
-      nowBR: nowBR(),
-      rodada_atual: status.rodada_atual,
-      status_mercado: status.status_mercado,
-      bola_rolando: status.bola_rolando,
-      fechamento: status.fechamento,
-      accessTokenConfigured: Boolean(accessToken),
-      accessTokenExp: exp,
-      refreshTokenConfigured: Boolean(REFRESH_TOKEN),
-      clientId: CLIENT_ID
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
+// ✅ novo: testa só o refresh
+app.get('/refresh-test', async (req, res) => {
+  const r = await refreshAccessTokenIfNeeded();
+  if (r?.error) return res.status(500).json({ ok: false, error: r.error });
+  return res.json({ ok: true, result: r, accessTokenExp: accessToken ? tokenExpSeconds(accessToken) : null });
 });
 
 app.get('/rodada', async (req, res) => {
   try {
     const status = await fetchMercadoStatus();
     const rodadaAtual = Number(status.rodada_atual || 1);
-
     const ligaData = await fetchLiga('rodada');
     const ligaNome = ligaData?.liga?.nome || 'Liga';
     const times = ligaData?.times || [];
-
     res.type('text/plain').send(buildRodadaMsg(ligaNome, rodadaAtual, times));
   } catch (e) {
     res.status(500).type('text/plain').send(`ERRO: ${e.message}`);
@@ -403,11 +396,9 @@ app.get('/geral', async (req, res) => {
   try {
     const status = await fetchMercadoStatus();
     const rodadaAtual = Number(status.rodada_atual || 1);
-
     const ligaData = await fetchLiga('campeonato');
     const ligaNome = ligaData?.liga?.nome || 'Liga';
     const times = ligaData?.times || [];
-
     res.type('text/plain').send(buildGeralMsg(ligaNome, rodadaAtual, times));
   } catch (e) {
     res.status(500).type('text/plain').send(`ERRO: ${e.message}`);
@@ -417,11 +408,9 @@ app.get('/geral', async (req, res) => {
 app.get('/mensal', async (req, res) => {
   try {
     const status = await fetchMercadoStatus();
-
     const ligaData = await fetchLiga('campeonato');
     const ligaNome = ligaData?.liga?.nome || 'Liga';
     const times = ligaData?.times || [];
-
     const msg = await buildMensalPersonalizadoMsg(ligaNome, status, times);
     res.type('text/plain').send(msg);
   } catch (e) {
