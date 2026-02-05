@@ -1,471 +1,494 @@
 /**
- * server.js (CommonJS)
- * Requer: express, cors, axios
- *
- * ENV:
- *  - PORT
- *  - TZ (ex: America/Sao_Paulo)
- *  - LEAGUE_SLUG (ex: show-de-bola-araca-f-c)
- *  - CARTOLA_CLIENT_ID (ex: cartola-web@apps.globoid)
- *  - CARTOLA_REFRESH_TOKEN (refresh_token do GOIDC)
- *
- * Observação:
- * - Access token é renovado automaticamente via refresh_token.
- * - Liga privada: usa /auth/liga/... com Bearer token.
+ * server.js — Cartola Mensagens (sem WhatsApp)
+ * - Não usa axios (usa fetch nativo do Node 18+)
+ * - Faz refresh automático do token via goidc.globo.com (OIDC)
+ * - Endpoints:
+ *   GET /debug
+ *   GET /rodada
+ *   GET /geral
+ *   GET /mensal   (mensal personalizado)
  */
 
-const express = require("express");
-const cors = require("cors");
-const axios = require("axios");
+const http = require("http");
+const { URL } = require("url");
 
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: "1mb" }));
-
-// ========== CONFIG ==========
+// ====== ENV ======
 const PORT = process.env.PORT || 3000;
-const TZ = process.env.TZ || "America/Sao_Paulo";
-const LEAGUE_SLUG = process.env.LEAGUE_SLUG || "show-de-bola-araca-f-c";
 
-const CARTOLA_CLIENT_ID = process.env.CARTOLA_CLIENT_ID || "";
-const CARTOLA_REFRESH_TOKEN = process.env.CARTOLA_REFRESH_TOKEN || "";
+const LEAGUE_SLUG = process.env.CARTOLA_LEAGUE_SLUG || "show-de-bola-araca-f-c";
+const CLIENT_ID = process.env.CARTOLA_CLIENT_ID || "cartola-web@apps.globoid";
+const REFRESH_TOKEN_ENV = process.env.CARTOLA_REFRESH_TOKEN;
 
-// Endpoints
-const CARTOLA_API = "https://api.cartola.globo.com";
-const GOIDC_TOKEN_URL =
+// OIDC token endpoint (Globo ID)
+const OIDC_TOKEN_URL =
   "https://goidc.globo.com/auth/realms/globo.com/protocol/openid-connect/token";
 
-// Cache em memória (Render free reinicia às vezes, mas está ok)
-let accessTokenCache = null;
-let accessTokenExpMs = null; // epoch ms
+// Cartola API base
+const CARTOLA_API = "https://api.cartola.globo.com";
 
-// ========== HELPERS ==========
+// ====== Token cache (em memória) ======
+let accessToken = null;
+let accessTokenExpEpoch = null; // segundos UNIX
+let refreshToken = REFRESH_TOKEN_ENV || null;
 
-function nowIso() {
-  return new Date().toISOString();
+let lastRefreshAt = null;
+let lastRefreshError = null;
+
+// ====== Helpers ======
+function json(res, status, obj) {
+  const body = JSON.stringify(obj, null, 2);
+  res.writeHead(status, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+  });
+  res.end(body);
 }
 
-function nowBR() {
-  try {
-    return new Date().toLocaleString("pt-BR", { timeZone: TZ });
-  } catch {
-    return new Date().toLocaleString("pt-BR");
-  }
+function text(res, status, body) {
+  res.writeHead(status, {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Cache-Control": "no-store",
+  });
+  res.end(body);
 }
 
-function isConfigured() {
-  return {
-    refreshTokenConfigured: Boolean(CARTOLA_REFRESH_TOKEN),
-    clientIdConfigured: Boolean(CARTOLA_CLIENT_ID),
-  };
+function nowEpochSec() {
+  return Math.floor(Date.now() / 1000);
+}
+
+function safeBool(v) {
+  return !!(v && String(v).trim().length > 0);
 }
 
 function decodeJwtPayload(token) {
-  // JWT payload é a parte do meio
-  const parts = (token || "").split(".");
-  if (parts.length < 2) return null;
-  const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-  const pad = "=".repeat((4 - (b64.length % 4)) % 4);
-  const json = Buffer.from(b64 + pad, "base64").toString("utf8");
-  return JSON.parse(json);
-}
-
-function setAccessToken(token) {
-  accessTokenCache = token;
-
-  // Tenta exp do JWT
+  // retorna payload do JWT (sem validar assinatura)
   try {
-    const payload = decodeJwtPayload(token);
-    if (payload && payload.exp) {
-      accessTokenExpMs = payload.exp * 1000;
-      return;
-    }
-  } catch {}
-
-  // Fallback: 4 min
-  accessTokenExpMs = Date.now() + 4 * 60 * 1000;
+    const parts = token.split(".");
+    if (parts.length < 2) return null;
+    const payload = parts[1];
+    const padded = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const buff = Buffer.from(padded, "base64");
+    return JSON.parse(buff.toString("utf8"));
+  } catch {
+    return null;
+  }
 }
 
-function accessTokenValid() {
-  if (!accessTokenCache || !accessTokenExpMs) return false;
-  // margem de 30s
-  return Date.now() < accessTokenExpMs - 30 * 1000;
+function buildFormUrlEncoded(params) {
+  const usp = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    usp.set(k, v);
+  }
+  return usp.toString();
 }
 
+// ====== OIDC Refresh ======
 async function refreshAccessToken() {
-  const { refreshTokenConfigured, clientIdConfigured } = isConfigured();
-  if (!refreshTokenConfigured || !clientIdConfigured) {
+  if (!safeBool(refreshToken)) {
+    throw new Error("refresh_token não configurado (CARTOLA_REFRESH_TOKEN).");
+  }
+  if (!safeBool(CLIENT_ID)) {
+    throw new Error("client_id não configurado (CARTOLA_CLIENT_ID).");
+  }
+
+  const body = buildFormUrlEncoded({
+    grant_type: "refresh_token",
+    client_id: CLIENT_ID,
+    refresh_token: refreshToken,
+  });
+
+  const resp = await fetch(OIDC_TOKEN_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Accept": "application/json",
+    },
+    body,
+  });
+
+  const raw = await resp.text();
+  let data = null;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    data = { raw };
+  }
+
+  if (!resp.ok) {
+    // Guardar para debug
+    lastRefreshAt = new Date().toISOString();
+    lastRefreshError = {
+      status: resp.status,
+      data,
+    };
     throw new Error(
-      "Refresh token ou client_id não configurados (CARTOLA_REFRESH_TOKEN / CARTOLA_CLIENT_ID)."
+      `Falha ao renovar token: HTTP ${resp.status} — ${typeof data === "object" ? JSON.stringify(data) : String(data)}`
     );
   }
 
-  // Form-url-encoded (padrão do OpenID token endpoint)
-  const body = new URLSearchParams();
-  body.append("grant_type", "refresh_token");
-  body.append("client_id", CARTOLA_CLIENT_ID);
-  body.append("refresh_token", CARTOLA_REFRESH_TOKEN);
+  // Esperado: access_token, expires_in, refresh_token (às vezes)
+  accessToken = data.access_token;
+  lastRefreshAt = new Date().toISOString();
+  lastRefreshError = null;
 
-  try {
-    const resp = await axios.post(GOIDC_TOKEN_URL, body.toString(), {
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        Accept: "application/json",
-      },
-      timeout: 15000,
-      validateStatus: () => true,
-    });
-
-    if (resp.status < 200 || resp.status >= 300) {
-      const msg =
-        resp.data?.error_description ||
-        resp.data?.error ||
-        JSON.stringify(resp.data || {});
-      throw new Error(`HTTP ${resp.status} — ${msg}`);
-    }
-
-    const { access_token } = resp.data || {};
-    if (!access_token) {
-      throw new Error("Resposta sem access_token (inesperado).");
-    }
-
-    setAccessToken(access_token);
-    return {
-      ok: true,
-      accessTokenExp: accessTokenExpMs ? new Date(accessTokenExpMs).toISOString() : null,
-    };
-  } catch (err) {
-    // padroniza mensagem
-    const m = err?.message || String(err);
-    throw new Error(`Falha ao renovar token: ${m}`);
+  // Expiração: preferir "exp" do JWT; senão usar expires_in
+  const payload = decodeJwtPayload(accessToken);
+  if (payload && payload.exp) {
+    accessTokenExpEpoch = payload.exp;
+  } else if (data.expires_in) {
+    accessTokenExpEpoch = nowEpochSec() + Number(data.expires_in);
+  } else {
+    accessTokenExpEpoch = nowEpochSec() + 300; // fallback 5 min
   }
+
+  // Se vier refresh_token novo, guardamos em memória (não expomos em endpoints)
+  if (data.refresh_token && String(data.refresh_token).startsWith("eyJ")) {
+    refreshToken = data.refresh_token;
+  }
+
+  return { ok: true };
 }
 
 async function ensureAccessToken() {
-  if (accessTokenValid()) return accessTokenCache;
-  await refreshAccessToken();
-  return accessTokenCache;
-}
-
-async function cartolaGet(path, params = {}) {
-  const token = await ensureAccessToken();
-
-  const url = `${CARTOLA_API}${path}`;
-  const resp = await axios.get(url, {
-    params,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/json",
-    },
-    timeout: 20000,
-    validateStatus: () => true,
-  });
-
-  if (resp.status === 401) {
-    // token expirou/invalidou no meio — tenta 1 refresh e repete
+  // Renova se não tem token ou se está para expirar (<60s)
+  const now = nowEpochSec();
+  if (!accessToken || !accessTokenExpEpoch || accessTokenExpEpoch < now + 60) {
     await refreshAccessToken();
-    const token2 = accessTokenCache;
-
-    const resp2 = await axios.get(url, {
-      params,
-      headers: {
-        Authorization: `Bearer ${token2}`,
-        Accept: "application/json",
-      },
-      timeout: 20000,
-      validateStatus: () => true,
-    });
-
-    return resp2;
   }
-
-  return resp;
+  return accessToken;
 }
 
-function safeNum(n) {
-  const x = Number(n);
-  return Number.isFinite(x) ? x : 0;
-}
+// ====== Cartola request (com retry automático) ======
+async function cartolaFetchJson(path, { auth = true } = {}) {
+  const url = `${CARTOLA_API}${path}`;
 
-function formatPts(n) {
-  // Cartola normalmente usa 2 casas
-  return safeNum(n).toFixed(2).replace(".", ",");
-}
+  // 1ª tentativa
+  let token = null;
+  if (auth) token = await ensureAccessToken();
 
-function monthRanges() {
-  // ranking mensal (personalizado) conforme você definiu
-  return [
-    { label: "jan/fev", start: 1, end: 4 },
-    { label: "mar", start: 5, end: 8 },
-    { label: "abr", start: 9, end: 13 },
-    { label: "mai", start: 14, end: 18 },
-    { label: "jul", start: 19, end: 21 },
-    { label: "ago", start: 22, end: 25 },
-    { label: "set", start: 26, end: 28 },
-    { label: "out", start: 29, end: 33 },
-    { label: "nov/dez", start: 34, end: 38 },
-  ];
-}
-
-function currentMonthRange(rodadaAtual) {
-  const ranges = monthRanges();
-  return ranges.find((r) => rodadaAtual >= r.start && rodadaAtual <= r.end) || null;
-}
-
-// ========== ROUTES ==========
-
-let lastWebhookAt = null;
-let lastWebhookMethod = null;
-let lastWebhookQuery = null;
-let lastWebhookBody = null;
-
-app.get("/", (req, res) => {
-  res.json({ ok: true, now: nowIso(), nowBR: nowBR() });
-});
-
-app.get("/debug", (req, res) => {
-  const conf = isConfigured();
-  res.json({
-    ok: true,
-    now: nowIso(),
-    nowBR: nowBR(),
-    leagueSlug: LEAGUE_SLUG,
-    accessTokenConfigured: Boolean(accessTokenCache),
-    accessTokenExp: accessTokenExpMs ? new Date(accessTokenExpMs).toISOString() : null,
-    refreshTokenConfigured: conf.refreshTokenConfigured,
-    clientIdConfigured: conf.clientIdConfigured,
-    clientIdValue: CARTOLA_CLIENT_ID || null,
-    lastWebhookAt,
-    lastWebhookMethod,
-    lastWebhookQuery,
-    lastWebhookBody,
+  let resp = await fetch(url, {
+    method: "GET",
+    headers: {
+      "Accept": "application/json",
+      ...(auth
+        ? {
+            "Authorization": `Bearer ${token}`,
+            "x-glb-app": "cartola_web",
+            "x-glb-auth": "oidc",
+          }
+        : {}),
+    },
   });
-});
 
-app.get("/refresh-test", async (req, res) => {
-  try {
-    const result = await refreshAccessToken();
-    res.json({ ok: true, now: nowIso(), ...result });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
+  // Se 401/Expired, tenta refresh + retry 1x
+  if (resp.status === 401 && auth) {
+    // força refresh
+    await refreshAccessToken();
 
-// Captura o status do jogo (rodada atual etc) — sem auth normalmente
-app.get("/status", async (req, res) => {
-  try {
-    const url = `${CARTOLA_API}/mercado/status`;
-    const resp = await axios.get(url, { timeout: 20000, validateStatus: () => true });
-    res.status(resp.status).json(resp.data);
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
-
-// Geral (campeonato)
-app.get("/geral", async (req, res) => {
-  try {
-    const resp = await cartolaGet(`/auth/liga/${LEAGUE_SLUG}`, {
-      orderBy: "campeonato",
-      page: 1,
+    token = await ensureAccessToken();
+    resp = await fetch(url, {
+      method: "GET",
+      headers: {
+        "Accept": "application/json",
+        "Authorization": `Bearer ${token}`,
+        "x-glb-app": "cartola_web",
+        "x-glb-auth": "oidc",
+      },
     });
+  }
 
-    if (resp.status < 200 || resp.status >= 300) {
-      return res.status(500).json({
-        ok: false,
-        error: `HTTP ${resp.status}`,
-        data: resp.data,
+  const raw = await resp.text();
+  let data = null;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    data = { raw };
+  }
+
+  if (!resp.ok) {
+    const msg =
+      data && data.mensagem
+        ? data.mensagem
+        : `HTTP note ok (${resp.status})`;
+
+    const err = new Error(`ERRO: HTTP ${resp.status} em ${url}\n${JSON.stringify(data)}`);
+    err.status = resp.status;
+    err.data = data;
+    err.messageFriendly = msg;
+    throw err;
+  }
+
+  return data;
+}
+
+// ====== Regras do mensal personalizado ======
+const MONTH_BLOCKS = [
+  { label: "jan/fev", start: 1, end: 4 },
+  { label: "mar", start: 5, end: 8 },
+  { label: "abr", start: 9, end: 13 },
+  { label: "mai", start: 14, end: 18 },
+  { label: "jul", start: 19, end: 21 },
+  { label: "ago", start: 22, end: 25 },
+  { label: "set", start: 26, end: 28 },
+  { label: "out", start: 29, end: 33 },
+  { label: "nov/dez", start: 34, end: 38 },
+];
+
+function getMonthBlockForRound(rodada) {
+  return (
+    MONTH_BLOCKS.find((b) => rodada >= b.start && rodada <= b.end) ||
+    MONTH_BLOCKS[0]
+  );
+}
+
+// Busca rodada atual no endpoint público
+async function getMercadoStatus() {
+  return await cartolaFetchJson("/mercado/status", { auth: false });
+}
+
+// Liga (privada) via /auth/liga/...
+async function getLeague(orderBy) {
+  return await cartolaFetchJson(
+    `/auth/liga/${encodeURIComponent(LEAGUE_SLUG)}?orderBy=${encodeURIComponent(
+      orderBy
+    )}&page=1`,
+    { auth: true }
+  );
+}
+
+// Pontos do time em uma rodada (para somar mensal personalizado)
+async function getTeamRoundPoints(timeId, rodada) {
+  // Endpoint mais comum: /auth/time/id/{time_id}/{rodada}
+  const data = await cartolaFetchJson(`/auth/time/id/${timeId}/${rodada}`, {
+    auth: true,
+  });
+
+  // Variantes possíveis no retorno (defensivo)
+  // Tenta capturar "pontos" ou "pontos_rodada"
+  if (typeof data.pontos === "number") return data.pontos;
+  if (typeof data.pontos_rodada_note === "number") return data.pontos_rodada_note;
+  if (typeof data.pontos_rodada === "number") return data.pontos_rodada;
+
+  // Às vezes vem em "time" ou "parciais"
+  if (data && data.time && typeof data.time.pontos === "number") return data.time.pontos;
+
+  // Fallback: se não achar, retorna 0
+  return 0;
+}
+
+// ====== Formatação de mensagens ======
+function fmtPoints(x) {
+  if (x === null || x === undefined) return "-";
+  if (typeof x !== "number") return String(x);
+  return x.toFixed(2).replace(".", ",");
+}
+
+function buildRankingLines(items, pointsKey, title, highlightTopN = 0) {
+  // items: [{nome, nome_cartola, pontos:{...}, ranking:{...}}]
+  const lines = [];
+  lines.push(title);
+
+  items.forEach((t, idx) => {
+    const pos = idx + 1;
+
+    const medal =
+      pos === 1 ? "🥇" : pos === 2 ? "🥈" : pos === 3 ? "🥉" : pos <= highlightTopN ? "🏅" : "•";
+
+    const points =
+      t.pontos && Object.prototype.hasOwnProperty.call(t.pontos, pointsKey)
+        ? t.pontos[pointsKey]
+        : null;
+
+    lines.push(
+      `${medal} ${pos}º — ${t.nome?.trim() || "Time"} (${t.nome_cartola || "-"}) — ${fmtPoints(points)} pts`
+    );
+  });
+
+  return lines.join("\n");
+}
+
+async function handlerRodada() {
+  const mercado = await getMercadoStatus();
+  const rodadaAtual = mercado?.rodada_atual;
+
+  const league = await getLeague("rodada");
+  const times = Array.isArray(league?.times) ? league.times.slice() : [];
+
+  // Ordena por ranking.rodada se existir; senão por pontos.rodada desc
+  times.sort((a, b) => {
+    const ra = a?.ranking?.rodada ?? 999999;
+    const rb = b?.ranking?.rodada ?? 999999;
+    if (ra !== rb) return ra - rb;
+    const pa = a?.pontos?.rodada ?? -999999;
+    const pb = b?.pontos?.rodada ?? -999999;
+    return pb - pa;
+  });
+
+  const header = `📊 Cartola — ${mercado?.nome_rodada || `Rodada ${rodadaAtual}`}\n`;
+  const body = buildRankingLines(times, "rodada", "🏁 Ranking da rodada", 0);
+
+  return `${header}\n${body}`;
+}
+
+async function handlerGeral() {
+  const mercado = await getMercadoStatus();
+  const rodadaAtual = mercado?.rodada_atual;
+
+  const league = await getLeague("campeonato");
+  const times = Array.isArray(league?.times) ? league.times.slice() : [];
+
+  // Ordena por ranking.campeonato ou pontos.campeonato
+  times.sort((a, b) => {
+    const ra = a?.ranking?.campeonato ?? 999999;
+    const rb = b?.ranking?.campeonato ?? 999999;
+    if (ra !== rb) return ra - rb;
+    const pa = a?.pontos?.campeonato ?? -999999;
+    const pb = b?.pontos?.campeonato ?? -999999;
+    return pb - pa;
+  });
+
+  const header = `📈 Cartola — Geral até agora (Rodada ${rodadaAtual})\n`;
+  const body = buildRankingLines(times, "campeonato", "🏆 Ranking geral", 0);
+
+  return `${header}\n${body}`;
+}
+
+async function handlerMensalPersonalizado() {
+  const mercado = await getMercadoStatus();
+  const rodadaAtual = mercado?.rodada_atual;
+
+  const block = getMonthBlockForRound(rodadaAtual || 1);
+
+  const league = await getLeague("campeonato");
+  const times = Array.isArray(league?.times) ? league.times.slice() : [];
+
+  // Para mensal personalizado: soma pontos das rodadas do bloco
+  // (somente até a rodadaAtual se estiver no meio do bloco)
+  const endRound = Math.min(block.end, rodadaAtual || block.start);
+
+  const results = [];
+  for (const t of times) {
+    const timeId = t.time_id;
+    let sum = 0;
+
+    for (let r = block.start; r <= endRound; r++) {
+      try {
+        const pts = await getTeamRoundPoints(timeId, r);
+        if (typeof pts === "number") sum += pts;
+      } catch {
+        // Se falhar em alguma rodada, conta 0
+      }
+    }
+
+    results.push({
+      time_id: timeId,
+      nome: t.nome,
+      nome_cartola: t.nome_cartola,
+      pontos_mes_custom: sum,
+    });
+  }
+
+  // Ordena desc por soma
+  results.sort((a, b) => b.pontos_mes_custom - a.pontos_mes_custom);
+
+  const lines = [];
+  lines.push(
+    `🗓️ Mensal personalizado — ${block.label} (Rodadas ${block.start} a ${block.end})`
+  );
+  lines.push(`📌 Parcial até a Rodada ${endRound}`);
+  lines.push("");
+
+  // Top 4 premiados
+  lines.push("💰 Premiados do mês (TOP 4):");
+  results.slice(0, 4).forEach((t, idx) => {
+    const medal = idx === 0 ? "🥇" : idx === 1 ? "🥈" : idx === 2 ? "🥉" : "🏅";
+    lines.push(
+      `${medal} ${idx + 1}º — ${t.nome?.trim() || "Time"} (${t.nome_cartola || "-"}) — ${fmtPoints(
+        t.pontos_mes_custom
+      )} pts`
+    );
+  });
+
+  lines.push("");
+  lines.push("📋 Classificação completa do mês:");
+  results.forEach((t, idx) => {
+    const pos = idx + 1;
+    const star = pos <= 4 ? "⭐" : "•";
+    lines.push(
+      `${star} ${pos}º — ${t.nome?.trim() || "Time"} (${t.nome_cartola || "-"}) — ${fmtPoints(
+        t.pontos_mes_custom
+      )} pts`
+    );
+  });
+
+  return lines.join("\n");
+}
+
+// ====== Server ======
+const server = http.createServer(async (req, res) => {
+  const u = new URL(req.url, `http://${req.headers.host}`);
+  const path = u.pathname;
+
+  try {
+    if (path === "/" || path === "/health") {
+      return json(res, 200, {
+        ok: true,
+        service: "cartola-mensagens",
+        now: new Date().toISOString(),
       });
     }
 
-    const data = resp.data || {};
-    const times = Array.isArray(data.times) ? data.times : [];
-
-    // ordena por pontos.campeonato (quando existir)
-    const sorted = [...times].sort(
-      (a, b) => safeNum(b?.pontos?.campeonato) - safeNum(a?.pontos?.campeonato)
-    );
-
-    // monta texto
-    let txt = `🏆 *GERAL — ${data?.liga?.nome || "Liga"}*\n`;
-    txt += `(${nowBR()})\n\n`;
-
-    if (!sorted.length || sorted.every((t) => t?.pontos?.campeonato == null)) {
-      txt += `Ainda sem pontuação no campeonato (aguardando início/fechamento da rodada).`;
-      return res.type("text/plain").send(txt);
-    }
-
-    sorted.forEach((t, idx) => {
-      const pos = idx + 1;
-      const nome = t?.nome || t?.slug || "Time";
-      const cartoleiro = t?.nome_cartola ? ` — ${t.nome_cartola}` : "";
-      const pts = formatPts(t?.pontos?.campeonato);
-      txt += `${pos}. ${nome}${cartoleiro} — ${pts}\n`;
-    });
-
-    return res.type("text/plain").send(txt);
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message || String(e) });
-  }
-});
-
-// Rodada (ranking da rodada atual — depende do Cartola fornecer pontos.rodada)
-app.get("/rodada", async (req, res) => {
-  try {
-    const statusUrl = `${CARTOLA_API}/mercado/status`;
-    const st = await axios.get(statusUrl, { timeout: 20000, validateStatus: () => true });
-    const rodadaAtual = st?.data?.rodada_atual;
-
-    const resp = await cartolaGet(`/auth/liga/${LEAGUE_SLUG}`, {
-      orderBy: "rodada",
-      page: 1,
-    });
-
-    if (resp.status < 200 || resp.status >= 300) {
-      return res.status(500).json({
-        ok: false,
-        error: `HTTP ${resp.status}`,
-        data: resp.data,
+    if (path === "/debug") {
+      // NÃO expor tokens completos por segurança
+      return json(res, 200, {
+        ok: true,
+        now: new Date().toISOString(),
+        leagueSlug: LEAGUE_SLUG,
+        clientIdConfigured: safeBool(CLIENT_ID),
+        clientIdValue: CLIENT_ID || null,
+        refreshTokenConfigured: safeBool(refreshToken),
+        accessTokenConfigured: safeBool(accessToken),
+        accessTokenExp: accessTokenExpEpoch,
+        accessTokenExpISO:
+          accessTokenExpEpoch ? new Date(accessTokenExpEpoch * 1000).toISOString() : null,
+        lastRefreshAt,
+        lastRefreshError,
+        hint:
+          "Se /rodada ou /geral der erro de refresh, o problema está no refresh_token ou client_id.",
       });
     }
 
-    const data = resp.data || {};
-    const times = Array.isArray(data.times) ? data.times : [];
-    const sorted = [...times].sort(
-      (a, b) => safeNum(b?.pontos?.rodada) - safeNum(a?.pontos?.rodada)
-    );
-
-    let txt = `⚽ *RODADA ${rodadaAtual ?? ""} — ${data?.liga?.nome || "Liga"}*\n`;
-    txt += `(${nowBR()})\n\n`;
-
-    if (!sorted.length || sorted.every((t) => t?.pontos?.rodada == null)) {
-      txt += `Ainda sem pontuação da rodada (pode estar antes do fechamento, ou a API ainda não liberou ranking da rodada).`;
-      return res.type("text/plain").send(txt);
+    if (path === "/rodada") {
+      const msg = await handlerRodada();
+      return text(res, 200, msg);
     }
 
-    sorted.forEach((t, idx) => {
-      const pos = idx + 1;
-      const nome = t?.nome || t?.slug || "Time";
-      const cartoleiro = t?.nome_cartola ? ` — ${t.nome_cartola}` : "";
-      const pts = formatPts(t?.pontos?.rodada);
-      txt += `${pos}. ${nome}${cartoleiro} — ${pts}\n`;
-    });
+    if (path === "/geral") {
+      const msg = await handlerGeral();
+      return text(res, 200, msg);
+    }
 
-    return res.type("text/plain").send(txt);
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message || String(e) });
+    if (path === "/mensal") {
+      const msg = await handlerMensalPersonalizado();
+      return text(res, 200, msg);
+    }
+
+    // rota desconhecida
+    return text(res, 404, "Not found");
+  } catch (err) {
+    // Padroniza erro (útil no Render)
+    const status = err && err.status ? err.status : 500;
+    return json(res, status, {
+      ok: false,
+      error: err?.message || String(err),
+      messageFriendly: err?.messageFriendly || null,
+      lastRefreshAt,
+      lastRefreshError,
+    });
   }
 });
 
-// Mensal personalizado (Top 4 do “mês” e lista completa de participantes + geral)
-app.get("/mensal", async (req, res) => {
-  try {
-    const st = await axios.get(`${CARTOLA_API}/mercado/status`, {
-      timeout: 20000,
-      validateStatus: () => true,
-    });
-
-    const rodadaAtual = st?.data?.rodada_atual || null;
-    const faixa = rodadaAtual ? currentMonthRange(rodadaAtual) : null;
-
-    // Geral (campeonato) pra exibir “classificação atual do geral”
-    const respGeral = await cartolaGet(`/auth/liga/${LEAGUE_SLUG}`, {
-      orderBy: "campeonato",
-      page: 1,
-    });
-
-    if (respGeral.status < 200 || respGeral.status >= 300) {
-      return res.status(500).json({
-        ok: false,
-        error: `HTTP ${respGeral.status}`,
-        data: respGeral.data,
-      });
-    }
-
-    const data = respGeral.data || {};
-    const times = Array.isArray(data.times) ? data.times : [];
-
-    // Enquanto a temporada não tiver pontos, avisa
-    const hasChampPoints = times.some((t) => t?.pontos?.campeonato != null);
-
-    let txt = `📅 *MENSAL (personalizado) — ${data?.liga?.nome || "Liga"}*\n`;
-    txt += `(${nowBR()})\n\n`;
-
-    if (!rodadaAtual) {
-      txt += `Status da rodada não disponível agora.\n`;
-    } else if (faixa) {
-      txt += `Faixa vigente: *Rodadas ${faixa.start}–${faixa.end} (${faixa.label})*\n`;
-    } else {
-      txt += `Faixa vigente: (não identificada)\n`;
-    }
-
-    txt += `\n🏅 *Premiação do mês: TOP 4*\n`;
-
-    // IMPORTANTE:
-    // A API do Cartola não entrega diretamente "soma por intervalo personalizado" de rodadas.
-    // Então, por enquanto, usamos o que existe com consistência:
-    // - quando a API começar a preencher pontos.mes (mês oficial do Cartola), usamos isso como base.
-    // - Se vier nulo, mostramos mensagem e seguimos com o geral.
-    const sortedMensal = [...times].sort(
-      (a, b) => safeNum(b?.pontos?.mes) - safeNum(a?.pontos?.mes)
-    );
-
-    const hasMonthPoints = sortedMensal.some((t) => t?.pontos?.mes != null);
-
-    if (!hasMonthPoints) {
-      txt += `Ainda sem pontuação “mês” disponível na API (isso deve aparecer após fechamento de rodadas).\n`;
-    } else {
-      sortedMensal.slice(0, 4).forEach((t, idx) => {
-        const medal = ["🥇", "🥈", "🥉", "🎖"][idx] || "🏅";
-        const nome = t?.nome || t?.slug || "Time";
-        const cartoleiro = t?.nome_cartola ? ` — ${t.nome_cartola}` : "";
-        const pts = formatPts(t?.pontos?.mes);
-        txt += `${medal} ${idx + 1}. ${nome}${cartoleiro} — ${pts}\n`;
-      });
-    }
-
-    // Lista de participantes
-    txt += `\n👥 *Participantes (${times.length})*\n`;
-    times.forEach((t) => {
-      const nome = t?.nome || t?.slug || "Time";
-      const cartoleiro = t?.nome_cartola ? ` — ${t.nome_cartola}` : "";
-      txt += `• ${nome}${cartoleiro}\n`;
-    });
-
-    // Geral atual (do 1º ao último)
-    txt += `\n🏆 *Geral (campeonato — do 1º ao último)*\n`;
-
-    if (!hasChampPoints) {
-      txt += `Ainda sem pontuação no geral (aguardando fechamento das rodadas iniciais).\n`;
-      return res.type("text/plain").send(txt);
-    }
-
-    const sortedGeral = [...times].sort(
-      (a, b) => safeNum(b?.pontos?.campeonato) - safeNum(a?.pontos?.campeonato)
-    );
-
-    sortedGeral.forEach((t, idx) => {
-      const pos = idx + 1;
-      const nome = t?.nome || t?.slug || "Time";
-      const pts = formatPts(t?.pontos?.campeonato);
-      txt += `${pos}. ${nome} — ${pts}\n`;
-    });
-
-    return res.type("text/plain").send(txt);
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message || String(e) });
-  }
-});
-
-// Webhook “dummy” (mantive pra debug de POSTs, se precisar no futuro)
-app.all("/webhook", (req, res) => {
-  lastWebhookAt = nowIso();
-  lastWebhookMethod = req.method;
-  lastWebhookQuery = req.query || null;
-  lastWebhookBody = req.body || null;
-  res.json({ ok: true });
-});
-
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+server.listen(PORT, () => {
+  console.log(`✅ cartola-mensagens rodando na porta ${PORT}`);
+  console.log(`➡️ League: ${LEAGUE_SLUG}`);
 });
